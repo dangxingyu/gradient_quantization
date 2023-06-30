@@ -1,6 +1,7 @@
 import torch
 import os
 import torch.distributed as dist
+import gc
 
 QUANTIZE_GROUP_SIZE=128
 

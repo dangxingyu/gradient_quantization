@@ -8,6 +8,7 @@ from utils import (
     butterfly_all_reduce,
     print_rank0
 )
+import gc
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -30,6 +31,8 @@ from torch.distributed.fsdp.wrap import (
     wrap,
 )
 from functools import partial
+
+sharding_strategy = ShardingStrategy.FULL_SHARD
 
 class ToyModel(nn.Module):
     def __init__(self, input_size, hidden_size):
@@ -61,15 +64,35 @@ def print_rank0(*args, **kwargs):
         print(*args, **kwargs)
 
 def int4_compress_hook(communication_group, grad, *args, **kwargs):
-    # print_rank0(f'before: ', grad)
-    # assert torch.all(args[0] == 0)
-    _grad = grad.detach().clone()
-    butterfly_all_reduce(grad, communication_group)
-    # print_rank0(f'after: ', grad)
-    world_size = dist.get_world_size()
-    _grad *= world_size
-    error = torch.abs(_grad - grad).mean() / torch.abs(_grad).mean()
-    print_rank0(f'error: ', error)
+    # print_rank0(grad.shape, args[0].shape)
+    # if torch.isnan(grad).any():
+    #     print_rank0('nan in grad')
+    # if torch.isnan(args[0]).any():
+    #     print_rank0('nan in args')
+    # rank = dist.get_rank()
+    # if rank == 0:
+    #     import pdb
+    #     pdb.set_trace()
+    # _grad = grad.detach().clone()
+    if sharding_strategy == ShardingStrategy.NO_SHARD:
+        butterfly_all_reduce(grad, communication_group)
+    else:
+        output_cache = args[0].detach().clone()
+        input_cache = []
+        # cut grad into chunks
+        chunk_size = grad.shape[0] // dist.get_world_size()
+        for i in range(dist.get_world_size()):
+            input_cache.append(grad[i * chunk_size: (i + 1) * chunk_size])
+        # print_rank0(f'input_cache: {input_cache[0].shape}')
+        dist.reduce_scatter(
+            output_cache, input_cache, group=communication_group, async_op=False
+        )
+        # update grad inplace
+        args[0].mul_(0).add_(output_cache)
+    # world_size = dist.get_world_size()
+    # _grad *= world_size
+    # error = torch.abs(_grad - grad).mean() / torch.abs(_grad).mean()
+    # print_rank0(f'error: ', error)
     return None
 
 def main():
@@ -121,8 +144,8 @@ def main():
     # y = x * 10 + 1
 
     communication_group = dist.group.WORLD
-    model.register_comm_hook(communication_group, int4_compress_hook)
-    print(model, file=open('model.txt', 'w'))
+    # model.register_comm_hook(communication_group, int4_compress_hook)
+    # print(model, file=open('model.txt', 'w'))
 
     for i in range(2):
         loss = model(**inputs).loss
